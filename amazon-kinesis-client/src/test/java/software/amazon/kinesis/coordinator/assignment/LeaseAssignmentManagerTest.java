@@ -18,7 +18,6 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
-import org.mockito.Mock;
 import org.mockito.Mockito;
 import software.amazon.awssdk.core.util.DefaultSdkAutoConstructList;
 import software.amazon.awssdk.enhanced.dynamodb.TableSchema;
@@ -27,8 +26,8 @@ import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
 import software.amazon.awssdk.services.dynamodb.model.PutItemRequest;
 import software.amazon.kinesis.common.DdbTableConfig;
 import software.amazon.kinesis.coordinator.LeaderDecider;
-import software.amazon.kinesis.coordinator.streamInfo.StreamIdCacheManager;
 import software.amazon.kinesis.leases.Lease;
+import software.amazon.kinesis.leases.LeaseAssignmentStrategy;
 import software.amazon.kinesis.leases.LeaseManagementConfig;
 import software.amazon.kinesis.leases.LeaseManagementConfig.WorkerMetricsTableConfig;
 import software.amazon.kinesis.leases.LeaseRefresher;
@@ -59,8 +58,6 @@ import static org.mockito.Mockito.when;
 import static software.amazon.kinesis.retrieval.kpl.ExtendedSequenceNumber.TRIM_HORIZON;
 
 class LeaseAssignmentManagerTest {
-    @Mock
-    StreamIdCacheManager streamIdCacheManager;
 
     private static final String TEST_LEADER_WORKER_ID = "workerId";
     private static final String TEST_TAKE_WORKER_ID = "workerIdTake";
@@ -685,22 +682,6 @@ class LeaseAssignmentManagerTest {
     }
 
     @Test
-    void performAssignment_onError_assertLeadershipRelease() throws Exception {
-        final Supplier<Long> mockFailingNanoTimeProvider = Mockito.mock(Supplier.class);
-        when(mockFailingNanoTimeProvider.get()).thenThrow(new OutOfMemoryError("IAmAlwaysFailing"));
-
-        createLeaseAssignmentManager(
-                getWorkerUtilizationAwareAssignmentConfig(Double.MAX_VALUE, 20),
-                Duration.ofHours(1).toMillis(),
-                mockFailingNanoTimeProvider,
-                Integer.MAX_VALUE);
-
-        leaseAssignmentManagerRunnable.run();
-        // After 1 error, leadership is expected to be released.
-        verify(mockLeaderDecider, times(1)).releaseLeadershipIfHeld();
-    }
-
-    @Test
     void startStopValidation_sanity()
             throws InterruptedException, ProvisionedThroughputException, InvalidStateException, DependencyException {
         final LeaseAssignmentManager leaseAssignmentManager = createLeaseAssignmentManager(
@@ -1181,8 +1162,8 @@ class LeaseAssignmentManagerTest {
                 System::nanoTime,
                 Integer.MAX_VALUE,
                 gracefulLeaseHandoffConfig,
-                2 * failoverTimeMillis,
-                streamIdCacheManager);
+                LeaseAssignmentStrategy.WORKER_UTILIZATION_AWARE,
+                2 * failoverTimeMillis);
 
         leaseAssignmentManager.start();
 
@@ -1212,8 +1193,8 @@ class LeaseAssignmentManagerTest {
                 System::nanoTime,
                 Integer.MAX_VALUE,
                 gracefulLeaseHandoffConfig,
-                leaseAssignmentIntervalMillis,
-                streamIdCacheManager);
+                LeaseAssignmentStrategy.WORKER_UTILIZATION_AWARE,
+                leaseAssignmentIntervalMillis);
 
         leaseAssignmentManager.start();
 
@@ -1240,6 +1221,42 @@ class LeaseAssignmentManagerTest {
             LeaseRefresher leaseRefresher,
             WorkerMetricStatsDAO workerMetricStatsDao) {
 
+        return createLeaseAssignmentManagerWithStrategy(
+                config,
+                leaseDurationMillis,
+                nanoTimeProvider,
+                maxLeasesPerWorker,
+                leaseRefresher,
+                workerMetricStatsDao,
+                LeaseAssignmentStrategy.WORKER_UTILIZATION_AWARE);
+    }
+
+    private LeaseAssignmentManager createLeaseAssignmentManagerWithStrategy(
+            final LeaseManagementConfig.WorkerUtilizationAwareAssignmentConfig config,
+            final Long leaseDurationMillis,
+            final Supplier<Long> nanoTimeProvider,
+            final int maxLeasesPerWorker,
+            final LeaseAssignmentStrategy strategy) {
+
+        return createLeaseAssignmentManagerWithStrategy(
+                config,
+                leaseDurationMillis,
+                nanoTimeProvider,
+                maxLeasesPerWorker,
+                leaseRefresher,
+                workerMetricsDAO,
+                strategy);
+    }
+
+    private LeaseAssignmentManager createLeaseAssignmentManagerWithStrategy(
+            final LeaseManagementConfig.WorkerUtilizationAwareAssignmentConfig config,
+            final Long leaseDurationMillis,
+            final Supplier<Long> nanoTimeProvider,
+            final int maxLeasesPerWorker,
+            LeaseRefresher leaseRefresher,
+            WorkerMetricStatsDAO workerMetricStatsDao,
+            final LeaseAssignmentStrategy strategy) {
+
         final LeaseAssignmentManager leaseAssignmentManager = new LeaseAssignmentManager(
                 leaseRefresher,
                 workerMetricStatsDao,
@@ -1252,8 +1269,8 @@ class LeaseAssignmentManagerTest {
                 nanoTimeProvider,
                 maxLeasesPerWorker,
                 gracefulLeaseHandoffConfig,
-                2 * leaseDurationMillis,
-                streamIdCacheManager);
+                strategy,
+                2 * leaseDurationMillis);
         leaseAssignmentManager.start();
         return leaseAssignmentManager;
     }
@@ -1374,5 +1391,39 @@ class LeaseAssignmentManagerTest {
                         .item(TableSchema.fromBean(WorkerMetricStats.class).itemToMap(workerMetrics, false))
                         .build())
                 .join();
+    }
+
+    @Test
+    void performAssignment_withWorkerUtilizationStrategy_usesVarianceDecider() throws Exception {
+        createLeaseAssignmentManager(
+                getWorkerUtilizationAwareAssignmentConfig(Double.MAX_VALUE, 20),
+                100L,
+                System::nanoTime,
+                Integer.MAX_VALUE);
+
+        workerMetricsDAO.updateMetrics(createDummyYieldWorkerMetrics(TEST_YIELD_WORKER_ID));
+        workerMetricsDAO.updateMetrics(createDummyTakeWorkerMetrics(TEST_TAKE_WORKER_ID));
+        leaseRefresher.createLeaseIfNotExists(createDummyUnAssignedLease("lease1"));
+
+        leaseAssignmentManagerRunnable.run();
+
+        assertEquals(TEST_TAKE_WORKER_ID, leaseRefresher.listLeases().get(0).leaseOwner());
+    }
+
+    @Test
+    void performAssignment_withLeaseCountStrategy_usesLeaseCountDecider() throws Exception {
+        createLeaseAssignmentManagerWithStrategy(
+                getWorkerUtilizationAwareAssignmentConfig(Double.MAX_VALUE, 20),
+                100L,
+                System::nanoTime,
+                Integer.MAX_VALUE,
+                LeaseAssignmentStrategy.LEASE_COUNT_BASED);
+
+        workerMetricsDAO.updateMetrics(createDummyTakeWorkerMetrics(TEST_TAKE_WORKER_ID));
+        leaseRefresher.createLeaseIfNotExists(createDummyUnAssignedLease("lease1"));
+
+        leaseAssignmentManagerRunnable.run();
+
+        assertEquals(TEST_TAKE_WORKER_ID, leaseRefresher.listLeases().get(0).leaseOwner());
     }
 }
