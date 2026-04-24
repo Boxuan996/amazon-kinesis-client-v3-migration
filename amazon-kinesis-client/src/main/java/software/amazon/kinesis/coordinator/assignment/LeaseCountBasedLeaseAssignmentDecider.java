@@ -42,7 +42,7 @@ import static java.util.Objects.nonNull;
 @Slf4j
 @KinesisClientInternalApi
 @RequiredArgsConstructor
-public final class LeaseCountBasedLeaseAssignmentDecider implements LeaseAssignmentDecider {
+public class LeaseCountBasedLeaseAssignmentDecider implements LeaseAssignmentDecider {
 
     private final LeaseAssignmentManager.InMemoryStorageView inMemoryStorageView;
     private final int maxLeasesForWorker;
