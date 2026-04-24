@@ -118,6 +118,7 @@ public final class LeaseAssignmentManager {
     private final ScheduledExecutorService executorService;
     private final Supplier<Long> nanoTimeProvider;
     private final int maxLeasesForWorker;
+    private final int maxLeasesToStealAtOneTime;
     private final LeaseManagementConfig.GracefulLeaseHandoffConfig gracefulLeaseHandoffConfig;
     private final LeaseAssignmentStrategy leaseAssignmentStrategy;
     private boolean tookOverLeadershipInThisRun = false;
@@ -288,7 +289,7 @@ public final class LeaseAssignmentManager {
     private LeaseAssignmentDecider getLeaseAssignmentDecider(InMemoryStorageView inMemoryStorageView) {
         final LeaseAssignmentDecider leaseAssignmentDecider;
         if (leaseAssignmentStrategy == LeaseAssignmentStrategy.LEASE_COUNT_BASED) {
-            leaseAssignmentDecider = new LeaseCountBasedLeaseAssignmentDecider(inMemoryStorageView, maxLeasesForWorker);
+            leaseAssignmentDecider = new LeaseCountBasedLeaseAssignmentDecider(inMemoryStorageView, maxLeasesForWorker, maxLeasesToStealAtOneTime);
         } else {
             leaseAssignmentDecider = new VarianceBasedLeaseAssignmentDecider(
                     inMemoryStorageView,
