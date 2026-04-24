@@ -46,6 +46,7 @@ public final class LeaseCountBasedLeaseAssignmentDecider implements LeaseAssignm
 
     private final LeaseAssignmentManager.InMemoryStorageView inMemoryStorageView;
     private final int maxLeasesForWorker;
+    private final int maxLeasesToStealPerWorkerPerCycle;
 
     /**
      * Assigns expired or unassigned leases to workers with the fewest current leases.
@@ -78,8 +79,16 @@ public final class LeaseCountBasedLeaseAssignmentDecider implements LeaseAssignm
 
         final Set<Lease> assignedLeases = new HashSet<>();
         int workerIndex = 0;
+        final Map<String, Integer> assignedThisCycle = new HashMap<>();
 
         for (final Lease lease : expiredOrUnAssignedLeases) {
+            // Advance past workers that have hit the per-cycle throttle
+            while (workerIndex < workerQueue.size()
+                    && maxLeasesToStealPerWorkerPerCycle > 0
+                    && assignedThisCycle.getOrDefault(workerQueue.get(workerIndex), 0) >= maxLeasesToStealPerWorkerPerCycle) {
+                workerIndex++;
+            }
+
             if (workerIndex >= workerQueue.size()) {
                 break;
             }
@@ -87,6 +96,7 @@ public final class LeaseCountBasedLeaseAssignmentDecider implements LeaseAssignm
             final String workerToAssign = workerQueue.get(workerIndex);
             assignLease(lease, workerToAssign);
             assignedLeases.add(lease);
+            assignedThisCycle.merge(workerToAssign, 1, Integer::sum);
 
             final int newCount = leaseCounts.get(workerToAssign) + 1;
             leaseCounts.put(workerToAssign, newCount);
@@ -119,6 +129,7 @@ public final class LeaseCountBasedLeaseAssignmentDecider implements LeaseAssignm
         // Two pointers: left (underloaded) and right (overloaded)
         int left = 0;
         int right = sortedWorkers.size() - 1;
+        final Map<String, Integer> reassignedThisCycle = new HashMap<>();
 
         while (left < right) {
             final Map.Entry<String, Integer> underloaded = sortedWorkers.get(left);
@@ -136,6 +147,13 @@ public final class LeaseCountBasedLeaseAssignmentDecider implements LeaseAssignm
                 continue;
             }
 
+            // Throttle: skip this underloaded worker if it has received enough this cycle
+            if (maxLeasesToStealPerWorkerPerCycle > 0
+                    && reassignedThisCycle.getOrDefault(underloaded.getKey(), 0) >= maxLeasesToStealPerWorkerPerCycle) {
+                left++;
+                continue;
+            }
+
             // Find available lease from overloaded worker. These are leases not pending handoffs
             final List<Lease> availableLeases = availableLeasesByWorker.get(overloaded.getKey());
             final Lease leaseToSteal =
@@ -145,6 +163,7 @@ public final class LeaseCountBasedLeaseAssignmentDecider implements LeaseAssignm
                 assignLease(leaseToSteal, underloaded.getKey());
                 underloaded.setValue(underloaded.getValue() + 1);
                 overloaded.setValue(overloaded.getValue() - 1);
+                reassignedThisCycle.merge(underloaded.getKey(), 1, Integer::sum);
             } else {
                 right--;
             }
