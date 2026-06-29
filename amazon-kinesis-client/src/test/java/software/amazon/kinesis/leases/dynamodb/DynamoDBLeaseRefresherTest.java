@@ -32,6 +32,7 @@ import software.amazon.awssdk.services.dynamodb.model.UpdateContinuousBackupsReq
 import software.amazon.awssdk.services.dynamodb.model.UpdateContinuousBackupsResponse;
 import software.amazon.kinesis.common.DdbTableConfig;
 import software.amazon.kinesis.leases.Lease;
+import software.amazon.kinesis.leases.LeaseSerializer;
 import software.amazon.kinesis.leases.LeaseRefresher;
 import software.amazon.kinesis.leases.exceptions.DependencyException;
 import software.amazon.kinesis.leases.exceptions.InvalidStateException;
@@ -1086,12 +1087,17 @@ class DynamoDBLeaseRefresherTest {
                         AttributeValue.builder().s("AAA_coordinatorState_key1").build(),
                 "entityType", AttributeValue.builder().s("COORDINATOR_STATE").build());
 
+        // CLIENT_VERSION_MIGRATION entity (Migration3.0) - caused SEV-2 in custom serializers
+        Map<String, AttributeValue> migrationItem = ImmutableMap.of(
+                "leaseKey", AttributeValue.builder().s("Migration3.0").build(),
+                "entityType", AttributeValue.builder().s("CLIENT_VERSION_MIGRATION").build());
+
         // Actual lease item on the second page
         Map<String, AttributeValue> leaseItem = serializer.toDynamoRecord(createDummyLease("zzz_lease1", "owner1"));
 
         // Page 1: only non-lease entities, has more pages
         ScanResponse page1 = ScanResponse.builder()
-                .items(workerMetricStatsItem, coordinatorStateItem)
+                .items(workerMetricStatsItem, coordinatorStateItem, migrationItem)
                 .lastEvaluatedKey(ImmutableMap.of(
                         "leaseKey",
                         AttributeValue.builder().s("AAA_coordinatorState_key1").build()))
@@ -1141,9 +1147,14 @@ class DynamoDBLeaseRefresherTest {
                         AttributeValue.builder().s("AAA_coordinatorState_key1").build(),
                 "entityType", AttributeValue.builder().s("COORDINATOR_STATE").build());
 
+        // CLIENT_VERSION_MIGRATION entity (Migration3.0)
+        Map<String, AttributeValue> migrationItem = ImmutableMap.of(
+                "leaseKey", AttributeValue.builder().s("Migration3.0").build(),
+                "entityType", AttributeValue.builder().s("CLIENT_VERSION_MIGRATION").build());
+
         // Single page with only non-lease entities, no more pages
         ScanResponse page1 = ScanResponse.builder()
-                .items(workerMetricStatsItem, coordinatorStateItem)
+                .items(workerMetricStatsItem, coordinatorStateItem, migrationItem)
                 .build();
 
         when(mockDdbClient.scan(any(ScanRequest.class))).thenReturn(CompletableFuture.completedFuture(page1));
@@ -1280,5 +1291,56 @@ class DynamoDBLeaseRefresherTest {
 
         assertEquals(2, result.size());
         verify(mockDdbClient, times(2)).scan(any(ScanRequest.class));
+    }
+
+    @Test
+    void listLeases_preFiltersNonLeaseEntities_protectingCustomSerializers() throws Exception {
+        // A custom serializer that would NPE if it received a non-lease record
+        // (simulates ExtendedDynamoDBLeaseSerializer before the null-check fix)
+        LeaseSerializer throwingOnNullSerializer = new DynamoDBLeaseSerializer() {
+            @Override
+            public Lease fromDynamoRecord(Map<String, AttributeValue> dynamoRecord) {
+                Lease lease = super.fromDynamoRecord(dynamoRecord);
+                if (lease == null) {
+                    throw new NullPointerException("Custom serializer received non-lease record!");
+                }
+                return lease;
+            }
+        };
+
+        final DynamoDbAsyncClient mockDdbClient = mock(DynamoDbAsyncClient.class, Mockito.RETURNS_MOCKS);
+        DynamoDBLeaseRefresher refresher = new DynamoDBLeaseRefresher(
+                TEST_LEASE_TABLE,
+                mockDdbClient,
+                throwingOnNullSerializer,
+                true,
+                NOOP_TABLE_CREATOR_CALLBACK,
+                Duration.ofSeconds(10),
+                new DdbTableConfig(),
+                false,
+                false,
+                new ArrayList<>());
+
+        // Non-lease entity that would cause NPE in unprotected custom serializers
+        Map<String, AttributeValue> migrationRecord = ImmutableMap.of(
+                "leaseKey", AttributeValue.builder().s("Migration3.0").build(),
+                "entityType", AttributeValue.builder().s("CLIENT_VERSION_MIGRATION").build());
+
+        // Valid lease record
+        Map<String, AttributeValue> leaseRecord = throwingOnNullSerializer.toDynamoRecord(
+                createDummyLease("shard-001", "worker-1"));
+
+        ScanResponse response = ScanResponse.builder()
+                .items(migrationRecord, leaseRecord)
+                .build();
+
+        when(mockDdbClient.scan(any(ScanRequest.class)))
+                .thenReturn(CompletableFuture.completedFuture(response));
+
+        // Should NOT throw NPE — pre-filter skips Migration3.0 before it reaches the serializer
+        List<Lease> leases = refresher.listLeases();
+
+        assertEquals(1, leases.size());
+        assertEquals("shard-001", leases.get(0).leaseKey());
     }
 }

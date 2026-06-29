@@ -77,6 +77,7 @@ import software.amazon.kinesis.common.FutureUtils;
 import software.amazon.kinesis.common.StreamIdentifier;
 import software.amazon.kinesis.common.UserAgentUtils;
 import software.amazon.kinesis.leases.DynamoUtils;
+import software.amazon.kinesis.leases.EntityType;
 import software.amazon.kinesis.leases.Lease;
 import software.amazon.kinesis.leases.LeaseRefresher;
 import software.amazon.kinesis.leases.LeaseSerializer;
@@ -619,6 +620,9 @@ public class DynamoDBLeaseRefresher implements LeaseRefresher {
                         FutureUtils.resolveOrCancelFuture(dynamoDBClient.scan(scanRequest), dynamoDbRequestTimeout);
                 for (final Map<String, AttributeValue> item : scanResult.items()) {
                     try {
+                        if (isNonLeaseEntity(item)) {
+                            continue;
+                        }
                         Lease lease = serializer.fromDynamoRecord(item);
                         if (lease != null) {
                             localLeases.add(lease);
@@ -706,6 +710,9 @@ public class DynamoDBLeaseRefresher implements LeaseRefresher {
                     for (Map<String, AttributeValue> item : scanResult.items()) {
                         log.debug("Got item {} from DynamoDB.", item.toString());
                         try {
+                            if (isNonLeaseEntity(item)) {
+                                continue;
+                            }
                             Lease lease = serializer.fromDynamoRecord(item);
                             // ignore non-lease entity types
                             if (lease != null) {
@@ -1455,5 +1462,15 @@ public class DynamoDBLeaseRefresher implements LeaseRefresher {
     private static void clearPendingShutdownAttributes(Lease lease) {
         lease.checkpointOwner(null);
         lease.checkpointOwnerTimeoutTimestampMillis(null);
+    }
+
+    /**
+     * Checks if a DynamoDB record represents a non-lease entity (e.g. Migration3.0, TableMigrationStatus).
+     * Non-lease records are filtered out before reaching the serializer to avoid breaking custom
+     * serializer implementations that don't handle null returns from fromDynamoRecord().
+     */
+    private static boolean isNonLeaseEntity(Map<String, AttributeValue> item) {
+        final String entityType = DynamoUtils.safeGetString(item, DynamoDBLeaseSerializer.ENTITY_TYPE_ATTRIBUTE_NAME);
+        return entityType != null && !EntityType.LEASE.getDdbValue().equals(entityType);
     }
 }
